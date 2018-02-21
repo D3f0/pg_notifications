@@ -1,13 +1,16 @@
 #!/usr/bin/env python
 
+import importlib
+import select
+from contextlib import contextmanager
+from functools import partial
+from multiprocessing import Process, Queue
+
 import click
 import psycopg2
 import psycopg2.extensions
-from psycopg2.extras import RealDictCursor
 from jinja2 import Template
-import importlib
-from multiprocessing import Process, Queue
-import select
+from psycopg2.extras import RealDictCursor
 
 
 TRIGGER_FUNCTION = """
@@ -68,20 +71,27 @@ ORDER BY event_object_table
 
 
 def get_associated_triggers(conn, table):
+    """Given a table name, return a list of triggers"""
     sql = GET_TABLE_TRIGGERS.render(table=table)
 
-
-
 def get_tables(ctx):
-    conn = ctx.obj['CONN'] #, ctx.obj['DBNAME']
-    cur = conn.cursor()
-    cur.execute("""
-    SELECT table_name FROM information_schema.tables
-    WHERE table_schema='public'
-    """.format(**locals()))
-    data = [row[0] for row in cur.fetchall()]
-    return data
+    """Get tables of current schema"""
+    with ctx.obj.get_cursor() as cursor:
+        cursor.execute("""
+        SELECT table_name FROM information_schema.tables
+        WHERE table_schema='public'
+        """.format(**locals()))
+        data = [row[0] for row in cursor.fetchall()]
+        return data
 
+@contextmanager
+def cursor_wrapper(conn, cursor_factory=psycopg2.extensions.cursor):
+    """
+    Context manager to generate a cursor
+    """
+    cursor = conn.cursor(cursor_factory=cursor_factory)
+    yield cursor
+    cursor.close()
 
 @click.group()
 @click.option('--verbose',
@@ -91,10 +101,6 @@ def get_tables(ctx):
               #prompt='Connection',
               default="dbname=nguru",
               help='The connection string')
-# @click.option('--channel',
-#               #prompt='Connection',
-#               default="messages",
-#               help='The connection string')
 @click.pass_context
 def cli(ctx, conn, verbose):
     try:
@@ -104,6 +110,7 @@ def cli(ctx, conn, verbose):
     ctx.obj['DBNAME'] = 'nguru'
     ctx.obj['VERBOSE'] = verbose
 
+    ctx.obj['get_cursor'] = partial(cursor_wrapper, ctx.obj.CONN)
 
 @cli.command()
 @click.argument('tables', nargs=-1)
@@ -125,10 +132,35 @@ def install(ctx, tables):
         else:
             click.echo("OK: {}".format(table))
 
+def get_table_triggers(ctx, tables):
+    with ctx.obj.get_cursor() as cursor:
+        retval = {}
+        for table in tables:
+            sql = GET_TABLE_TRIGGERS.render(table=table)
+            cursor.execute(sql)
+            click.echo(sql)
+            if cursor.rowcount < 1:
+                continue
+            for _, trigger_name, event, action, when in cursor.fetchall():
+                events = retval.setdefault(event, [])
+                events.append((action, when))
+        return retval
 
 @cli.command()
 @click.pass_context
 def list_tables(ctx):
+
+    tables = get_tables(ctx)
+    tirggers = get_table_triggers(ctx, tables)
+    import ipdb ; ipdb.set_trace()
+    for table in get_tables(ctx):
+        click.echo("* {}".format(table))
+
+@cli.command()
+@click.pass_context
+def list_triggers(ctx):
+    tables = get_tables(ctx)
+    tirggers = get_table_triggers(ctx, tables)
     for table in get_tables(ctx):
         click.echo("* {}".format(table))
 
@@ -148,6 +180,14 @@ def iter_events(ctx, channel='events', timeout=None):
             while conn.notifies:
                 notify = conn.notifies.pop(0)
                 yield (notify.pid, notify.channel, notify.payload)
+
+
+@cli.command()
+@click.pass_context
+def get_triggers(ctx, ):
+    with ctx.obj.get_cursor() as cursor:
+        cursor.execute("select * from mara_di;")
+        click.echo(cursor.fetchall())
 
 @cli.command()
 @click.option('--timeout', type=int, default=0)
@@ -188,8 +228,10 @@ def watch(ctx, timeout, callback, ipc):
             click.echo("Received event: {}".format(event))
 
 
-
+class AttrDict(dict):
+    """Use dot notation instead of inexing"""
+    __getattr__ = dict.__getitem__
 
 
 if __name__ == '__main__':
-    cli(obj={})
+    cli(obj=AttrDict())
